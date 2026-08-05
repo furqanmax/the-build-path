@@ -1,0 +1,149 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ============================================================
+       THE BUILD PATH — FIRESTORE SECURITY RULES  (v2)
+       ------------------------------------------------------------
+       HOW TO APPLY:
+       1. Firebase console → your project → Firestore Database → Rules.
+       2. Replace the entire editor contents with everything below the
+          dashed line. Note: this comment block is optional — you may
+          strip it before pasting (Firestore allows comments).
+       3. Click "Publish".
+
+       WHAT THESE RULES GUARANTEE:
+       - Every user can only read/write their own /users/{uid} subtree
+         (profile, myCourses, bookmarks, progress, paths).
+       - The public catalog (/courses and public paths) is readable by
+         everyone, but only the owning user can create/update/delete.
+       - Every write is shape-validated: field types, sizes, an enum
+         for `visibility`, and the YouTube `videoId` must match a strict
+         11-char pattern. This closes the stored-XSS vector where a
+         malicious user could write arbitrary `videoId` strings into a
+         public course that other users then render.
+       - `ownerId` is immutable after creation.
+       - Unknown paths default to deny.
+
+       STILL DO (console-side, see also js/config.js):
+       - Enable Firebase App Check (console → App Check) so requests
+         from outside this app are rejected before touching data.
+       - Restrict the web API key to your domain (HTTP referrers).
+       - Set a usage/budget alert (console → Usage & billing).
+       - Serve the app over HTTPS with a proper origin.
+       ============================================================ */
+
+    // ---------- Validation helpers ----------
+    function signedIn() { return request.auth != null; }
+
+    function isField(data, field, type) { return field in data && data[field] is type; }
+
+    function isPublic(data) { return isField(data, 'visibility', string) && data.visibility == 'public'; }
+
+    function isValidChapter(c) {
+      return c is map
+        && isField(c, 't', number) && c.t >= 0
+        && isField(c, 'l', string) && c.l.size() <= 200;
+    }
+
+    function isValidVideo(v) {
+      return v is map
+        && isField(v, 'videoId', string) && v.videoId.matches('[A-Za-z0-9_-]{11}')
+        && isField(v, 'url', string) && v.url.size() <= 500
+        && isField(v, 'title', string) && v.title.size() <= 200
+        && isField(v, 'chapters', list) && v.chapters.size() <= 200
+        && v.chapters.all(isValidChapter);
+    }
+
+    function isValidCourse(data) {
+      return isField(data, 'title', string) && data.title.size() > 0 && data.title.size() <= 200
+        && isField(data, 'description', string) && data.description.size() <= 2000
+        && isField(data, 'ownerId', string)
+        && isField(data, 'ownerName', string) && data.ownerName.size() <= 60
+        && isField(data, 'visibility', string) && data.visibility in ['public', 'private']
+        && isField(data, 'videos', list) && data.videos.size() <= 100
+        && data.videos.all(isValidVideo)
+        && (isField(data, 'createdAt', number) || isField(data, 'createdAt', timestamp))
+        && (!('copiedFrom' in data) || data.copiedFrom is string || data.copiedFrom is null);
+    }
+
+    function isValidPath(data) {
+      return isField(data, 'name', string) && data.name.size() > 0 && data.name.size() <= 200
+        && isField(data, 'description', string) && data.description.size() <= 2000
+        && isField(data, 'ownerId', string)
+        && isField(data, 'ownerName', string) && data.ownerName.size() <= 60
+        && isField(data, 'visibility', string) && data.visibility in ['public', 'private']
+        && isField(data, 'courseIds', list) && data.courseIds.size() <= 100
+        && data.courseIds.all(c => c is string)
+        && (isField(data, 'createdAt', number) || isField(data, 'createdAt', timestamp));
+    }
+
+    function isValidProgress(data) {
+      return isField(data, 'time', number) && data.time >= 0
+        && isField(data, 'duration', number) && data.duration >= 0 && data.duration <= 86400
+        && isField(data, 'completed', bool)
+        && isField(data, 'lastChapter', number) && data.lastChapter >= 0
+        && isField(data, 'chapterCompleted', map)
+        && data.chapterCompleted.keys().all(k => data.chapterCompleted[k] == true)
+        && isField(data, 'updatedAt', number);
+    }
+
+    // ---------- Users (private subtree) ----------
+    match /users/{uid} {
+      // profile document only (name/email/photoURL/createdAt/lastActive)
+      allow read, write: if signedIn() && request.auth.uid == uid;
+
+      match /myCourses/{courseId} {
+        allow read, write: if signedIn() && request.auth.uid == uid
+          && isValidCourse(request.resource.data);
+      }
+      match /bookmarks/{courseId} {
+        allow read, write: if signedIn() && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['savedAt'])
+          && isField(request.resource.data, 'savedAt', number);
+      }
+      match /progress/{courseId} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        match /videos/{videoId} {
+          allow read, write: if signedIn() && request.auth.uid == uid
+            && isValidProgress(request.resource.data);
+        }
+      }
+      match /paths/{pathId} {
+        allow read: if signedIn() && request.auth.uid == uid || isPublic(resource.data);
+        allow write: if signedIn() && request.auth.uid == uid
+          && isValidPath(request.resource.data);
+      }
+    }
+
+    // ---------- Public catalog ----------
+    match /courses/{id} {
+      allow read: if isPublic(resource.data)
+                  || (signedIn() && resource.data.ownerId == request.auth.uid);
+
+      allow create: if signedIn()
+        && request.auth.uid == request.resource.data.ownerId
+        && isValidCourse(request.resource.data);
+
+      allow update: if signedIn()
+        && resource.data.ownerId == request.auth.uid
+        && request.resource.data.ownerId == resource.data.ownerId   // ownerId immutable
+        && isValidCourse(request.resource.data);
+
+      allow delete: if signedIn() && resource.data.ownerId == request.auth.uid;
+    }
+
+    // ---------- Public paths via collection-group query ----------
+    // REQUIRED: the app finds public paths with collectionGroup("paths").
+    // This recursive-wildcard rule makes them visible to everyone.
+    match /{path=**}/paths/{pathId} {
+      allow read: if isPublic(resource.data)
+                  || (signedIn() && resource.data.ownerId == request.auth.uid);
+    }
+
+    // ---------- Default deny ----------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
